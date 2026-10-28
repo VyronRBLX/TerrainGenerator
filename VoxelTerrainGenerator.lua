@@ -1,3 +1,4 @@
+
 --!strict
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -76,7 +77,6 @@ local SETTINGS: Settings = {
 	DETAIL_FREQUENCY = 0.025,
 	DETAIL_AMPLITUDE = 6,
 
-	-- stops the edges of the map from dropping off too hard
 	EDGE_FALLOFF_START = 0.78,
 	EDGE_FALLOFF_AMPLITUDE = 10,
 
@@ -134,10 +134,11 @@ local SETTINGS: Settings = {
 
 local function getMaterial(name: string): MaterialSettings
 	local material = SETTINGS.MATERIALS[name]
-	assert(material, ("no entry in SETTINGS.MATERIALS for %q"):format(name))
+	assert(material, ("no material set up for %q"):format(name))
 	return material
 end
 
+-- Startup checks
 for _, materialName in SETTINGS.LAYERS do
 	getMaterial(materialName)
 end
@@ -162,8 +163,8 @@ local VERTICAL_CELLS = (SETTINGS.MAX_HEIGHT - SETTINGS.MIN_HEIGHT) / BLOCK_SIZE
 local SEA_LEVEL_CELLS = (SETTINGS.SEA_LEVEL - SETTINGS.MIN_HEIGHT) / BLOCK_SIZE
 local HALF_SIZE = SETTINGS.MAP_SIZE / 2
 
--- this script runs 3 times: once plain (sets up the controller), then as the
--- controller, then as each worker. the role attribute tells them apart
+-- script makes the controller, controller makes workers
+-- bit clunky but keeps everything in one script
 if not actor then
 	local controllerActor = Instance.new("Actor")
 	controllerActor.Name = "BlockTerrainGenerationController"
@@ -183,6 +184,7 @@ if role == "Worker" then
 		warn("worker has no controller reference")
 		return
 	end
+
 	local controllerActor = controllerLink.Value
 	if not controllerActor or not controllerActor:IsA("Actor") then
 		warn("worker controller reference is invalid")
@@ -205,10 +207,10 @@ if role == "Worker" then
 		local encodedHeights: { string } = table.create(width * depth)
 		local index = 0
 
-		for localX = 0, width - 1 do
-			for localZ = 0, depth - 1 do
-				local worldX = -HALF_SIZE + (startX + localX) * BLOCK_SIZE + BLOCK_SIZE * 0.5
-				local worldZ = -HALF_SIZE + (startZ + localZ) * BLOCK_SIZE + BLOCK_SIZE * 0.5
+		for x = 0, width - 1 do
+			for z = 0, depth - 1 do
+				local worldX = -HALF_SIZE + (startX + x) * BLOCK_SIZE + BLOCK_SIZE * 0.5
+				local worldZ = -HALF_SIZE + (startZ + z) * BLOCK_SIZE + BLOCK_SIZE * 0.5
 
 				local broad = math.noise(
 					(worldX + noiseOffsetX) * SETTINGS.NOISE_FREQUENCY,
@@ -224,13 +226,15 @@ if role == "Worker" then
 				local height = SETTINGS.BASE_HEIGHT
 					+ broad * SETTINGS.NOISE_AMPLITUDE
 					+ detail * SETTINGS.DETAIL_AMPLITUDE
-					- edgeFalloff
+				- edgeFalloff
+
 				height = math.clamp(height, SETTINGS.MIN_HEIGHT + BLOCK_SIZE, SETTINGS.MAX_HEIGHT - BLOCK_SIZE)
 				height = math.floor(height / BLOCK_SIZE + 0.5) * BLOCK_SIZE
 
 				local solidCells = math.clamp(math.floor((height - SETTINGS.MIN_HEIGHT) / BLOCK_SIZE), 1, VERTICAL_CELLS)
 				index += 1
-				-- two bytes per column so tiny block sizes can go past 255 cells tall
+
+				-- store it as two bytes instead of one, just in case the height range gets bigger
 				encodedHeights[index] = string.char(math.floor(solidCells / 256), solidCells % 256)
 			end
 		end
@@ -320,12 +324,12 @@ local function getChunkBounds(chunkIndex: number): (number, number, number, numb
 	local chunkZ = math.floor((chunkIndex - 1) / CHUNKS_PER_AXIS)
 	local startX = chunkX * CHUNK_CELLS
 	local startZ = chunkZ * CHUNK_CELLS
+
 	return startX, startZ,
 		math.min(CHUNK_CELLS, GRID_CELLS - startX),
 		math.min(CHUNK_CELLS, GRID_CELLS - startZ)
 end
 
--- cell index -> world position (centre of the cell)
 local function cellCenter(cell: number): number
 	return -HALF_SIZE + (cell - 0.5) * BLOCK_SIZE
 end
@@ -354,9 +358,11 @@ local function createFoliagePart(
 	part.CastShadow = material.CastShadow ~= false
 	part.CanCollide = material.CanCollide
 	part.CanTouch = false
+
 	if not part.CanCollide then
 		part.CanQuery = false
 	end
+
 	part.Parent = parent
 end
 
@@ -370,13 +376,13 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 	folder.Name = "Foliage"
 	folder.Parent = parent
 
-	-- same seed as the terrain so a seed always gives the same trees
+	-- same seed = same trees, so it doesn't reshuffle every time
 	local rng = Random.new(seed + 4242)
 	local offsetRng = Random.new(seed)
-	local forestOffsetX = offsetRng:NextNumber(-10000, 10000)
-	local forestOffsetZ = offsetRng:NextNumber(-10000, 10000)
+	local forestX = offsetRng:NextNumber(-10000, 10000)
+	local forestZ = offsetRng:NextNumber(-10000, 10000)
 
-	-- cells already used by a trunk or leaf, so canopies don't stack on each other
+	-- keep track of occupied cells so leaves don't overlap everything
 	local occupied: { [number]: boolean } = {}
 	local trunkColumns: { [number]: boolean } = {}
 
@@ -386,6 +392,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 
 	local function treeNearby(x: number, z: number): boolean
 		local spacing = foliage.TREE_SPACING_CELLS
+
 		for dx = -spacing, spacing do
 			for dz = -spacing, spacing do
 				if trunkColumns[(x + dx) + (z + dz) * 4096] then
@@ -393,11 +400,13 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 				end
 			end
 		end
+
 		return false
 	end
 
 	local function isFlatEnough(x: number, z: number): boolean
 		local here = heights[x][z]
+
 		for dx = -1, 1 do
 			for dz = -1, 1 do
 				if math.abs(heights[x + dx][z + dz] - here) > foliage.MAX_SLOPE_CELLS then
@@ -405,10 +414,11 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 				end
 			end
 		end
+
 		return true
 	end
 
-	-- one flat layer of leaves. neighbouring cells along X get merged into one part
+	-- leaves get made in horizontal strips, saves a ridiculous number of parts
 	local function placeLeafLayer(
 		cx: number,
 		cz: number,
@@ -421,7 +431,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 		for dz = -radius, radius do
 			local runStart: number? = nil
 
-			-- goes one past the edge so the last run always gets flushed
+			-- one extra step at the end so the last strip gets made too
 			for dx = -radius, radius + 1 do
 				local include = false
 
@@ -431,6 +441,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 					include = true
 
 					local isCorner = math.abs(dx) == radius and math.abs(dz) == radius
+
 					if isCorner and (cornerChance <= 0 or rng:NextNumber() > cornerChance) then
 						include = false
 					elseif dx == 0 and dz == 0 and y <= trunkTop then
@@ -446,12 +457,14 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 
 				if include then
 					occupied[voxelKey(cx + dx, y, cz + dz)] = true
+
 					if not runStart then
 						runStart = dx
 					end
 				elseif runStart then
 					local firstCell = cx + runStart
 					local lastCell = cx + dx - 1
+
 					createFoliagePart(
 						folder,
 						"Leaves",
@@ -460,6 +473,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 						CFrame.new(cellCenter((firstCell + lastCell) / 2), cellCenterY(y), cellCenter(cz + dz)),
 						color
 					)
+
 					runStart = nil
 				end
 			end
@@ -474,6 +488,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 		for y = ground + 1, trunkTop do
 			occupied[voxelKey(x, y, z)] = true
 		end
+
 		trunkColumns[x + z * 4096] = true
 
 		createFoliagePart(
@@ -484,7 +499,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 			CFrame.new(cellCenter(x), SETTINGS.MIN_HEIGHT + (ground + trunkHeight * 0.5) * BLOCK_SIZE, cellCenter(z))
 		)
 
-		-- tiny bit of random darkening so the trees don't all match
+		-- tiny colour variation makes the canopy look a bit less copy pasted
 		local leafColor = getMaterial("Leaves").Color:Lerp(Color3.new(0, 0, 0), rng:NextNumber(0, 0.14))
 
 		placeLeafLayer(x, z, trunkTop - 1, 2, 0.5, trunkTop, leafColor)
@@ -493,7 +508,6 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 		placeLeafLayer(x, z, trunkTop + 2, 1, 0, trunkTop, leafColor)
 	end
 
-	-- trees first
 	local treeCount = 0
 	for x = 3, GRID_CELLS - 2 do
 		for z = 3, GRID_CELLS - 2 do
@@ -502,17 +516,19 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 				continue
 			end
 
-			-- low frequency noise makes forests and clearings instead of even spacing
+			-- noise handles the big forest patches, random chance fills them in
 			local forestNoise = math.noise(
-				(cellCenter(x) + forestOffsetX) * foliage.FOREST_FREQUENCY + 113,
-				(cellCenter(z) + forestOffsetZ) * foliage.FOREST_FREQUENCY - 71
+				(cellCenter(x) + forestX) * foliage.FOREST_FREQUENCY + 113,
+				(cellCenter(z) + forestZ) * foliage.FOREST_FREQUENCY - 71
 			)
+
 			local density = math.clamp((forestNoise + 0.25) / 0.5, 0, 1)
 			local chance = foliage.TREE_CHANCE * (0.15 + 1.85 * density)
 
 			if rng:NextNumber() < chance and not treeNearby(x, z) and isFlatEnough(x, z) then
 				placeTree(x, z)
 				treeCount += 1
+
 				if treeCount % 20 == 0 then
 					RunService.PostSimulation:Wait()
 				end
@@ -520,13 +536,14 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 		end
 	end
 
-	-- then tufts and flowers on whatever grass is left
+	-- little plants go in after trees so they don't end up inside the trunks
 	local flowerColors = foliage.FLOWER_COLORS
 	local jitter = BLOCK_SIZE * 0.3
 
 	for x = 1, GRID_CELLS do
 		for z = 1, GRID_CELLS do
 			local ground = heights[x][z]
+
 			if getCellType(heights, x, ground, z) ~= SETTINGS.LAYERS.SURFACE then
 				continue
 			end
@@ -555,6 +572,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 					Vector3.new(BLOCK_SIZE * 0.08, stemHeight, BLOCK_SIZE * 0.08),
 					CFrame.new(px, surfaceY + stemHeight * 0.5, pz)
 				)
+
 				createFoliagePart(
 					folder,
 					"FlowerHead",
@@ -565,6 +583,7 @@ local function generateFoliage(heights: HeightGrid, seed: number, parent: Instan
 				)
 			else
 				local tuftHeight = BLOCK_SIZE * rng:NextNumber(0.3, 0.55)
+
 				createFoliagePart(
 					folder,
 					"GrassTuft",
@@ -583,6 +602,7 @@ end
 
 local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: number)
 	local heights: HeightGrid = table.create(GRID_CELLS)
+
 	for x = 1, GRID_CELLS do
 		heights[x] = table.create(GRID_CELLS, 1)
 	end
@@ -590,17 +610,19 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 	for chunkIndex = 1, CHUNK_COUNT do
 		local encoded = encodedChunks[chunkIndex]
 		local startX, startZ, width, depth = getChunkBounds(chunkIndex)
+
 		if not encoded or #encoded ~= width * depth * 2 then
 			error(("missing or invalid terrain chunk %d"):format(chunkIndex))
 		end
 
 		local byteIndex = 0
-		for localX = 0, width - 1 do
-			for localZ = 0, depth - 1 do
+		for x = 0, width - 1 do
+			for z = 0, depth - 1 do
 				byteIndex += 2
 				local highByte = string.byte(encoded, byteIndex - 1) or 0
 				local lowByte = string.byte(encoded, byteIndex) or 1
-				heights[startX + localX + 1][startZ + localZ + 1] = highByte * 256 + lowByte
+
+				heights[startX + x + 1][startZ + z + 1] = highByte * 256 + lowByte
 			end
 		end
 	end
@@ -616,7 +638,7 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 
 	type Run = { Material: string, StartY: number, EndY: number }
 
-	-- for every column, the vertical runs of one material (keyed by material + y range)
+	-- collect vertical runs first, then merge matching ones sideways into bigger parts
 	local runsAt: { { { [string]: boolean } } } = {}
 	local visited: { { { [string]: boolean } } } = {}
 	local runInfo: { [string]: Run } = {}
@@ -624,6 +646,7 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 	for x = 1, GRID_CELLS do
 		runsAt[x] = {}
 		visited[x] = {}
+
 		for z = 1, GRID_CELLS do
 			runsAt[x][z] = {}
 			visited[x][z] = {}
@@ -631,6 +654,7 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 			local y = 1
 			while y <= VERTICAL_CELLS do
 				local materialName = getCellType(heights, x, y, z)
+
 				if not materialName then
 					y += 1
 					continue
@@ -640,9 +664,10 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 				repeat
 					y += 1
 				until y > VERTICAL_CELLS or getCellType(heights, x, y, z) ~= materialName
-				local endY = y - 1
 
+				local endY = y - 1
 				local key = string.format("%s:%d:%d", materialName, startY, endY)
+
 				runsAt[x][z][key] = true
 				runInfo[key] = { Material = materialName, StartY = startY, EndY = endY }
 			end
@@ -657,7 +682,7 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 						continue
 					end
 
-					-- grow the box in Z first, then X
+					-- try to make the rectangle bigger in Z first, then widen it in X
 					local depth = 1
 					while z + depth <= GRID_CELLS
 						and runsAt[x][z + depth][key]
@@ -668,15 +693,18 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 					local width = 1
 					while x + width <= GRID_CELLS do
 						local rowMatches = true
+
 						for runZ = z, z + depth - 1 do
 							if not runsAt[x + width][runZ][key] or visited[x + width][runZ][key] then
 								rowMatches = false
 								break
 							end
 						end
+
 						if not rowMatches then
 							break
 						end
+
 						width += 1
 					end
 
@@ -708,10 +736,11 @@ local function buildBlockTerrain(encodedChunks: { [number]: string }, seed: numb
 					block.Parent = terrainFolder
 				end
 			end
+
 			RunService.PostSimulation:Wait()
 		end
 
-		-- lives inside the terrain folder so the next generate wipes it too
+		-- keep foliage under this folder too, next generation can clear it all at once
 		generateFoliage(heights, seed, terrainFolder)
 	end)
 
@@ -731,7 +760,7 @@ actor:BindToMessage("ChunkReady", function(
 	chunkIndex: number,
 	encoded: string
 )
-	-- ignore leftovers from a generation that already timed out
+	-- ignore late replies if that generation already timed out
 	if not isGenerating or resultGenerationId ~= generationId then
 		return
 	end
@@ -741,14 +770,17 @@ actor:BindToMessage("ChunkReady", function(
 
 	chunkResults[chunkIndex] = encoded
 	completedChunks += 1
+
 	if completedChunks < CHUNK_COUNT then
 		return
 	end
 
 	local finishedGenerationId = generationId
 	local resultsForBuild = chunkResults
+
 	task.spawn(function()
 		local ok, errorMessage = pcall(buildBlockTerrain, resultsForBuild, seed)
+
 		if generationId == finishedGenerationId then
 			isGenerating = false
 			chunkResults = {}
@@ -759,7 +791,7 @@ actor:BindToMessage("ChunkReady", function(
 				SETTINGS.MAP_SIZE,
 				SETTINGS.MAP_SIZE,
 				seed
-			))
+				))
 		else
 			warn("Generation failed: " .. tostring(errorMessage))
 		end
@@ -785,7 +817,7 @@ local function startGeneration(seed: number)
 		SETTINGS.MAP_SIZE,
 		SETTINGS.MAP_SIZE,
 		seed
-	))
+		))
 
 	for chunkIndex = 1, CHUNK_COUNT do
 		local worker = workerActors[((chunkIndex - 1) % #workerActors) + 1]
@@ -821,6 +853,7 @@ end
 for _, player in Players:GetPlayers() do
 	connectPlayer(player)
 end
+
 Players.PlayerAdded:Connect(connectPlayer)
 
 createWorkers()
@@ -829,6 +862,7 @@ local readyDeadline = os.clock() + 5
 while readyWorkers < #workerActors and os.clock() < readyDeadline do
 	task.wait()
 end
+
 if readyWorkers < #workerActors then
 	warn("Workers never reported ready, generation is disabled")
 	return
